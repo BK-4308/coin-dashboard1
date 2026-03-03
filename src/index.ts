@@ -58,17 +58,30 @@ interface DashboardRow {
 }
 
 async function fetchKRWMarkets(): Promise<MarketInfo[]> {
-	const res = await fetch(`${UPBIT_BASE}/market/all?is_details=false`);
-	if (!res.ok) throw new Error('Upbit markets failed');
-	const list = (await res.json()) as MarketInfo[];
+	const res = await fetch(`${UPBIT_BASE}/market/all?is_details=false`, {
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`Upbit markets ${res.status}`);
+	let list: MarketInfo[];
+	try {
+		list = (await res.json()) as MarketInfo[];
+	} catch {
+		throw new Error('Upbit markets invalid JSON');
+	}
+	if (!Array.isArray(list)) throw new Error('Upbit markets not array');
 	return list.filter((m) => m.market.startsWith('KRW-'));
 }
 
 async function fetchCandles(unit: number, market: string, count: number): Promise<MinuteCandle[]> {
 	const url = `${UPBIT_BASE}/candles/minutes/${unit}?market=${encodeURIComponent(market)}&count=${count}`;
-	const res = await fetch(url);
-	if (!res.ok) return [];
-	return (await res.json()) as MinuteCandle[];
+	try {
+		const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+		if (!res.ok) return [];
+		const data = await res.json();
+		return Array.isArray(data) ? (data as MinuteCandle[]) : [];
+	} catch {
+		return [];
+	}
 }
 
 /** 동시 요청 수 제한 (Upbit 10회/초) */
@@ -135,6 +148,13 @@ function dashboardHTML(): string {
         <option value="30">30</option>
         <option value="60">60</option>
         <option value="200">200</option>
+      </select>
+    </label>
+    <label>마켓 수
+      <select id="limit">
+        <option value="30">30개</option>
+        <option value="50" selected>50개</option>
+        <option value="100">100개</option>
       </select>
     </label>
     <button type="button" id="refresh">새로고침</button>
@@ -209,12 +229,16 @@ function dashboardHTML(): string {
       status.textContent = '불러오는 중…';
       const unit = document.getElementById('unit').value;
       const count = document.getElementById('count').value;
+      const limit = document.getElementById('limit').value;
       try {
-        const res = await fetch('/api/dashboard?unit=' + unit + '&count=' + count);
-        if (!res.ok) throw new Error(res.statusText);
+        const res = await fetch('/api/dashboard?unit=' + unit + '&count=' + count + '&limit=' + limit);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || res.statusText);
+        }
         const data = await res.json();
         rows = data.rows || [];
-        status.textContent = rows.length + '개 마켓';
+        status.textContent = data.totalMarkets != null ? rows.length + '/' + data.totalMarkets + '개 마켓' : rows.length + '개 마켓';
         render();
       } catch (e) {
         status.textContent = '오류: ' + e.message;
@@ -254,17 +278,20 @@ export default {
 		}
 
 		// API: 대시보드용 거래량·RSI 집계 (서버에서 Upbit 호출 후 정렬용 데이터 반환)
+		// Worker CPU/실행 시간 한도 때문에 마켓 수 제한 (limit 파라미터, 기본 50)
 		if (path === '/api/dashboard') {
 			const unit = Math.min(240, Math.max(1, parseInt(url.searchParams.get('unit') || '15', 10) || 15));
 			const count = Math.min(200, Math.max(14, parseInt(url.searchParams.get('count') || '30', 10) || 30));
+			const limit = Math.min(100, Math.max(10, parseInt(url.searchParams.get('limit') || '50', 10) || 50));
 			const allowedUnits = [1, 3, 5, 10, 15, 30, 60, 240];
 			const safeUnit = allowedUnits.includes(unit) ? unit : 15;
 
 			try {
-				const markets = await fetchKRWMarkets();
+				const allMarkets = await fetchKRWMarkets();
+				const markets = allMarkets.slice(0, limit);
 				const rows: DashboardRow[] = await runBatched(
 					markets,
-					8,
+					5,
 					async (m) => {
 						const candles = await fetchCandles(safeUnit, m.market, count);
 						if (candles.length === 0) {
@@ -291,10 +318,19 @@ export default {
 						};
 					},
 				);
-				return Response.json({ rows }, { headers: { 'Cache-Control': 'no-store' } });
+				return Response.json(
+					{ rows, totalMarkets: allMarkets.length, limit },
+					{ headers: { 'Cache-Control': 'no-store' } },
+				);
 			} catch (e) {
-				return Response.json({ error: String(e) }, { status: 502 });
+				const message = e instanceof Error ? e.message : String(e);
+				return Response.json({ error: message }, { status: 502, headers: { 'Content-Type': 'application/json' } });
 			}
+		}
+
+		// favicon 등 404 방지
+		if (path === '/favicon.ico') {
+			return new Response(null, { status: 204 });
 		}
 
 		return new Response('Not Found', { status: 404 });
